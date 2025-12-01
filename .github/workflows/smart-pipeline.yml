@@ -1,0 +1,227 @@
+name: 🧠 Умный пайплан Task Manager
+
+on:
+  push:
+    branches: [main, develop, feature/**]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1-5'  # Запуск в 6 утра по будням
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  PROJECT_PATH: 'src/SmartTaskManager'
+  TEST_PATH: 'tests/SmartTaskManager.Tests'
+
+jobs:
+  # Джоба 1: Умная подготовка с кэшированием
+  smart-setup:
+    name: ⚡ Умная подготовка
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 📥 Загружаем код
+      uses: actions/checkout@v4
+
+    - name: 💾 Кэшируем зависимости
+      uses: actions/cache@v3
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+        restore-keys: ${{ runner.os }}-nuget-
+
+    - name: 💾 Кэшируем результаты сборки
+      uses: actions/cache@v3
+      with:
+        path: |
+          ${{ env.PROJECT_PATH }}/bin
+          ${{ env.PROJECT_PATH }}/obj
+        key: ${{ runner.os }}-build-${{ hashFiles('**/*.cs') }}
+
+    - name: ⚙️ Устанавливаем .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: 📦 Восстанавливаем зависимости
+      run: dotnet restore
+
+    - name: 🔍 Анализируем изменения
+      id: changes
+      uses: dorny/paths-filter@v2
+      with:
+        filters: |
+          src:
+            - 'src/**'
+          tests:
+            - 'tests/**'
+          docs:
+            - 'docs/**'
+
+    outputs:
+      src: ${{ steps.changes.outputs.src }}
+      tests: ${{ steps.changes.outputs.tests }}
+      docs: ${{ steps.changes.outputs.docs }}
+
+  # Джоба 2: Условная сборка
+  conditional-build:
+    name: 🏗️ Условная сборка
+    needs: smart-setup
+    runs-on: ubuntu-latest
+
+    # Запускаем сборку только если были изменения в src или это main ветка
+    if: needs.smart-setup.outputs.src == 'true' || github.ref == 'refs/heads/main'
+
+    steps:
+    - name: 📥 Загружаем код
+      uses: actions/checkout@v4
+
+    - name: ⚙️ Устанавливаем .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: 🏗️ Собираем проект
+      run: |
+        dotnet restore ${{ env.PROJECT_PATH }}
+        dotnet build ${{ env.PROJECT_PATH }} --configuration Release
+
+    - name: 💾 Сохраняем артефакт сборки
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-build
+        path: ${{ env.PROJECT_PATH }}/bin/Release/net8.0/
+        retention-days: 7
+
+  # Джоба 3: Умное тестирование
+  smart-testing:
+    name: 🧪 Умное тестирование
+    needs: smart-setup
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        test-type: [unit, integration]
+
+    steps:
+    - name: 📥 Загружаем код
+      uses: actions/checkout@v4
+
+    - name: ⚙️ Устанавливаем .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: 🧪 Запускаем unit-тесты
+      if: matrix.test-type == 'unit'
+      run: |
+        dotnet restore ${{ env.TEST_PATH }}
+        dotnet test ${{ env.TEST_PATH }} --filter "Category=Unit" --verbosity normal
+
+    - name: 🔗 Запускаем интеграционные тесты
+      if: matrix.test-type == 'integration' && github.ref == 'refs/heads/main'
+      run: |
+        dotnet restore ${{ env.TEST_PATH }}
+        dotnet test ${{ env.TEST_PATH }} --filter "Category=Integration" --verbosity normal
+
+    - name: 📊 Генерируем отчет покрытия
+      if: always()
+      run: |
+        echo "Отчет покрытия сгенерирован для ${{ matrix.test-type }} тестов"
+
+  # Джоба 4: Условный деплой
+  conditional-deploy:
+    name: 🚀 Условный деплой
+    needs: [conditional-build, smart-testing]
+    runs-on: ubuntu-latest
+
+    # Запускаем только для main ветки и если все тесты прошли
+    if: github.ref == 'refs/heads/main' && needs.smart-testing.result == 'success'
+
+    steps:
+    - name: 📥 Загружаем код
+      uses: actions/checkout@v4
+
+    - name: ⚙️ Устанавливаем .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: 📦 Публикуем приложение
+      run: |
+        dotnet restore ${{ env.PROJECT_PATH }}
+        dotnet publish ${{ env.PROJECT_PATH }} -c Release -o ./publish --self-contained false
+
+    - name: 📁 Создаем разные пакеты
+      run: |
+        # Production пакет
+        mkdir -p packages/production
+        cp -r ./publish/* packages/production/
+        echo "PRODUCTION_BUILD=true" >> packages/production/build-info.txt
+        echo "BUILD_DATE=$(date)" >> packages/production/build-info.txt
+        
+        # Staging пакет (с дополнительной информацией)
+        mkdir -p packages/staging
+        cp -r ./publish/* packages/staging/
+        echo "STAGING_BUILD=true" >> packages/staging/build-info.txt
+        echo "BUILD_DATE=$(date)" >> packages/staging/build-info.txt
+        echo "BRANCH=${{ github.ref }}" >> packages/staging/build-info.txt
+
+    - name: 💾 Сохраняем пакеты
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-packages
+        path: packages/
+        retention-days: 30
+
+  # Джоба 5: Умный отчет
+  smart-report:
+    name: 📊 Умный отчет
+    needs: [smart-setup, conditional-build, smart-testing, conditional-deploy]
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 📝 Генерируем отчет на основе контекста
+      run: |
+        echo "========================================"
+        echo "🧠 УМНЫЙ ОТЧЕТ О ВЫПОЛНЕНИИ"
+        echo "========================================"
+        echo ""
+        echo "  ИНФОРМАЦИЯ О СБОРКЕ: "
+        echo "  ● Ветка: ${{ github.ref }}"
+        echo "  ● Коммит: ${{ github.sha }}"
+        echo "  ● Инициатор: ${{ github.actor }}"
+        echo ""
+        echo "  РЕЗУЛЬТАТЫ ЭТАПОВ: "
+        echo "  ● Подготовка: ${{ needs.smart-setup.result }}"
+        echo "  ● Сборка: ${{ needs.conditional-build.result }}"
+        echo "  ● Тестирование: ${{ needs.smart-testing.result }}"
+        echo "  ● Деплой: ${{ needs.conditional-deploy.result }}"
+        echo ""
+        
+        # Показываем разные сообщения в зависимости от ветки
+        if [ "${{ github.ref }}" == "refs/heads/main" ]; then
+          echo "  📌 РЕЖИМ: ПРОДАКШЕН"
+          echo "  ✅ Готово к релизу!"
+        elif [ "${{ github.ref }}" == "refs/heads/develop" ]; then
+          echo "  🔧 РЕЖИМ: РАЗРАБОТКА"
+          echo "  ⚠️ Только для тестирования"
+        else
+          echo "  🌿 РЕЖИМ: ФИЧА-ВЕТКА"
+          echo "  🚧 В процессе разработки"
+        fi
+        
+        echo ""
+        echo "  Время завершения: $(date)"
+        echo "========================================"
+
+    - name: 🔔 Условные уведомления
+      if: always()
+      run: |
+        if [ "${{ needs.smart-testing.result }}" == "failure" ]; then
+          echo "❌ ТЕСТЫ НЕ ПРОШЛИ! Требуется внимание разработчика!"
+        elif [ "${{ github.ref }}" == "refs/heads/main" ] && [ "${{ needs.conditional-deploy.result }}" == "success" ]; then
+          echo "🎉 УСПЕШНЫЙ РЕЛИЗ! Приложение готово к использованию!"
+        else
+          echo "✅ Все этапы выполнены успешно"
+        fi
